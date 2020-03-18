@@ -67,8 +67,10 @@ import Test.QuickCheck.Arbitrary
 import Test.QuickCheck.Poly
 
 import Control.Applicative
+import Control.Monad
 import Data.Char
 import Data.Word
+import Data.Maybe
 import Data.List( intersperse )
 import Data.Ratio
 import qualified Data.IntMap as IntMap
@@ -101,6 +103,7 @@ data a :-> c where
   Nil   :: a :-> c
   Table :: Eq a => [(a,c)] -> (a :-> c)
   Map   :: (a -> b) -> (b -> a) -> (b :-> c) -> (a :-> c)
+  (:<>:) :: (a :-> c) -> (a :-> c) -> (a :-> c)
 
 instance Functor ((:->) a) where
   fmap f (Pair p)    = Pair (fmap (fmap f) p)
@@ -109,6 +112,15 @@ instance Functor ((:->) a) where
   fmap f Nil         = Nil
   fmap f (Table xys) = Table [ (x,f y) | (x,y) <- xys ]
   fmap f (Map g h p) = Map g h (fmap f p)
+  fmap f (p:<>:q)    = fmap f p :<>: fmap f q
+
+instance Semigroup c => Semigroup (a :-> c) where
+  (<>) = (:<>:)
+
+instance Semigroup c => Monoid (a :-> c) where
+  mempty = Nil
+
+
 
 instance (Show a, Show b) => Show (a:->b) where
   show p = showFunction p Nothing
@@ -125,12 +137,16 @@ showFunction p md =
 
 -- turning a concrete function into an abstract function (with a default result)
 abstract :: (a :-> c) -> c -> (a -> c)
-abstract (Pair p)    d (x,y) = abstract (fmap (\q -> abstract q d y) p) d x
-abstract (p :+: q)   d exy   = either (abstract p d) (abstract q d) exy
-abstract (Unit c)    _ _     = c
-abstract Nil         d _     = d
-abstract (Table xys) d x     = head ([y | (x',y) <- xys, x == x'] ++ [d])
-abstract (Map g _ p) d x     = abstract p d (g x)
+abstract f d x = fromMaybe d $ abstract' f x
+
+abstract' :: (a :-> c) -> a -> Maybe c
+abstract' (Pair p)    (x,y) = join $ abstract' (fmap (\q -> abstract' q y) p) x
+abstract' (p :+: q)   exy   = either (abstract' p) (abstract' q) exy
+abstract' (Unit c)    _     = Just c
+abstract' Nil         _     = Nothing
+abstract' (Table xys) x     = listToMaybe ([y | (x',y) <- xys, x == x'])
+abstract' (Map g _ p) x     = abstract' p (g x)
+abstract' (p :<>: q)  x     = abstract' p x <|> abstract' q x
 
 -- generating a table from a concrete function
 table :: (a :-> c) -> [(a,c)]
@@ -141,6 +157,7 @@ table (Unit c)    = [ ((), c) ]
 table Nil         = []
 table (Table xys) = xys
 table (Map _ h p) = [ (h x, c) | (x,c) <- table p ]
+table (f :<>: g) = table f ++ table g  -- TODO(sandy): filter out the second half
 
 --------------------------------------------------------------------------
 -- Function
@@ -496,6 +513,9 @@ shrinkFun shr (Map g h p) =
   mapp g h Nil = Nil
   mapp g h p   = Map g h p
 
+shrinkFun shr (f :<>: g) =
+  [ f, g ] ++ shrinkFun shr f ++ shrinkFun shr g
+
 --------------------------------------------------------------------------
 -- the Fun modifier
 
@@ -508,8 +528,23 @@ shrinkFun shr (Map g h p) =
 data Fun a b = Fun (a :-> b, b, Shrunk) (a -> b)
 data Shrunk = Shrunk | NotShrunk deriving Eq
 
+instance Semigroup Shrunk where
+  Shrunk <> _ = Shrunk
+  _ <> Shrunk = Shrunk
+  NotShrunk <> NotShrunk = NotShrunk
+
+instance Monoid Shrunk where
+  mempty = NotShrunk
+
 instance Functor (Fun a) where
   fmap f (Fun (p, d, s) g) = Fun (fmap f p, f d, s) (f . g)
+
+instance (Function a, Semigroup b) => Semigroup (Fun a b) where
+  Fun (fn1, b1, s1) f1 <> Fun (fn2, b2, s2) f2 =
+    Fun (fn1 <> fn2, b1 <> b2, s1 <> s2) (f1 <> f2)
+
+instance (Function a, Monoid b) => Monoid (Fun a b) where
+  mempty = Fun (Nil, mempty, mempty) mempty
 
 #if defined(__GLASGOW_HASKELL__) && __GLASGOW_HASKELL__ >= 708
 -- | A modifier for testing functions.
